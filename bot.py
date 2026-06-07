@@ -97,7 +97,7 @@ def main_menu():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я бот для работы с временной почтой (зеркало Mail.tm).\n\n"
+        "👋 Привет! Я бот для работы с временной почтой.\n\n"
         "Выберите нужное действие:",
         reply_markup=main_menu()
     )
