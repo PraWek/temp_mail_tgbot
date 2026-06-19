@@ -8,26 +8,32 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 import httpx
 
-# Токен теперь безопасно берется из переменных окружения
+# Токен безопасно берется из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_URL = "https://api.mail.tm"
 
 # Временная "база данных" в оперативной памяти (user_id -> {"address": "...", "token": "..."})
 users_db = {}
 
-# Инициализация бота и диспетчера
 if not BOT_TOKEN:
     logging.error("Переменная окружения BOT_TOKEN не задана!")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
+# --- FSM Состояния для входа ---
+class LoginState(StatesGroup):
+    waiting_for_address = State()
+    waiting_for_password = State()
+
+
 # --- Вспомогательные функции для работы с API Mail.tm ---
 
 async def get_domain():
-    """Получает доступный домен для регистрации"""
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{API_URL}/domains")
         data = response.json()
@@ -35,7 +41,6 @@ async def get_domain():
 
 
 async def create_account(address, password):
-    """Создает почтовый ящик"""
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{API_URL}/accounts",
@@ -45,7 +50,6 @@ async def create_account(address, password):
 
 
 async def get_token(address, password):
-    """Получает JWT токен для авторизации"""
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{API_URL}/token",
@@ -57,7 +61,6 @@ async def get_token(address, password):
 
 
 async def get_messages(token):
-    """Получает список входящих писем"""
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{API_URL}/messages",
@@ -67,7 +70,6 @@ async def get_messages(token):
 
 
 async def get_message(token, msg_id):
-    """Получает содержимое конкретного письма"""
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{API_URL}/messages/{msg_id}",
@@ -77,7 +79,6 @@ async def get_message(token, msg_id):
 
 
 def generate_random_string(length=10):
-    """Генератор случайной строки для логина и пароля"""
     letters = string.ascii_lowercase + string.digits
     return ''.join(random.choice(letters) for _ in range(length))
 
@@ -87,8 +88,15 @@ def generate_random_string(length=10):
 def main_menu():
     builder = InlineKeyboardBuilder()
     builder.button(text="🆕 Создать ящик", callback_data="create_mail")
+    builder.button(text="🔑 Войти в ящик", callback_data="login_mail")
     builder.button(text="📥 Проверить входящие", callback_data="check_mail")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def cancel_menu():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="cancel_action")
     return builder.as_markup()
 
 
@@ -103,6 +111,18 @@ async def cmd_start(message: types.Message):
     )
 
 
+# Обработчик отмены любого действия (FSM)
+@dp.callback_query(F.data == "cancel_action")
+async def process_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "🚫 Действие отменено.",
+        reply_markup=main_menu()
+    )
+
+
+# === БЛОК СОЗДАНИЯ ЯЩИКА ===
+
 @dp.callback_query(F.data == "create_mail")
 async def process_create_mail(callback: types.CallbackQuery):
     await callback.message.edit_text("⏳ Генерирую адрес и регистрирую ящик...")
@@ -115,14 +135,13 @@ async def process_create_mail(callback: types.CallbackQuery):
 
         if await create_account(address, password):
             token = await get_token(address, password)
-            # Сохраняем данные пользователя в словарь
             users_db[callback.from_user.id] = {"address": address, "token": token}
 
             await callback.message.edit_text(
                 f"✅ <b>Ваш новый почтовый ящик готов!</b>\n\n"
                 f"📧 <b>Адрес:</b> <code>{address}</code>\n"
                 f"🔑 <b>Пароль:</b> <code>{password}</code>\n\n"
-                f"Ящик привязан к вашему аккаунту.",
+                f"<i>⚠️ Обязательно сохраните пароль, чтобы войти в ящик позже!</i>",
                 parse_mode="HTML",
                 reply_markup=main_menu()
             )
@@ -132,11 +151,74 @@ async def process_create_mail(callback: types.CallbackQuery):
         await callback.message.edit_text(f"❌ Произошла ошибка: {e}", reply_markup=main_menu())
 
 
+# === БЛОК АВТОРИЗАЦИИ (ВХОДА) ===
+
+@dp.callback_query(F.data == "login_mail")
+async def process_login_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "Введите адрес вашей почты (например, <code>example@domain.com</code>):",
+        parse_mode="HTML",
+        reply_markup=cancel_menu()
+    )
+    await state.set_state(LoginState.waiting_for_address)
+
+
+@dp.message(LoginState.waiting_for_address)
+async def process_login_address(message: types.Message, state: FSMContext):
+    address = message.text.strip()
+    await state.update_data(address=address)
+
+    await message.answer(
+        f"📧 Адрес: <b>{address}</b>\n\nТеперь введите пароль от ящика:",
+        parse_mode="HTML",
+        reply_markup=cancel_menu()
+    )
+    await state.set_state(LoginState.waiting_for_password)
+
+
+@dp.message(LoginState.waiting_for_password)
+async def process_login_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    user_data = await state.get_data()
+    address = user_data["address"]
+
+    # Удаляем сообщение с паролем в целях безопасности (если бот имеет права)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    msg = await message.answer("⏳ Авторизация...")
+
+    token = await get_token(address, password)
+
+    if token:
+        # Успешный вход
+        users_db[message.from_user.id] = {"address": address, "token": token}
+        await msg.edit_text(
+            f"✅ <b>Вы успешно вошли в почту!</b>\n\n"
+            f"Текущий ящик: <code>{address}</code>",
+            parse_mode="HTML",
+            reply_markup=main_menu()
+        )
+    else:
+        # Ошибка входа
+        await msg.edit_text(
+            "❌ <b>Неверный адрес или пароль.</b>\nПожалуйста, попробуйте снова.",
+            parse_mode="HTML",
+            reply_markup=main_menu()
+        )
+
+    await state.clear()
+
+
+# === БЛОК ПРОВЕРКИ И ЧТЕНИЯ ПИСЕМ ===
+
 @dp.callback_query(F.data == "check_mail")
 async def process_check_mail(callback: types.CallbackQuery):
     user_data = users_db.get(callback.from_user.id)
     if not user_data:
-        await callback.answer("У вас нет активного ящика. Сначала создайте его!", show_alert=True)
+        await callback.answer("У вас нет активного ящика. Создайте его или войдите!", show_alert=True)
         return
 
     await callback.message.edit_text("⏳ Проверяю входящие...")
@@ -155,7 +237,6 @@ async def process_check_mail(callback: types.CallbackQuery):
         builder = InlineKeyboardBuilder()
         text = f"📬 <b>Входящие письма</b> (последние 5):\n\n"
 
-        # Показываем только последние 5 писем
         for idx, msg in enumerate(messages[:5]):
             sender = html.escape(msg['from']['address'])
             subject = html.escape(msg.get('subject', 'Без темы'))
@@ -176,7 +257,7 @@ async def process_read_mail(callback: types.CallbackQuery):
     user_data = users_db.get(callback.from_user.id)
 
     if not user_data:
-        await callback.answer("Сессия истекла. Создайте новый ящик.", show_alert=True)
+        await callback.answer("Сессия истекла. Войдите в ящик заново.", show_alert=True)
         return
 
     await callback.message.edit_text("⏳ Загружаю письмо...")
@@ -190,7 +271,6 @@ async def process_read_mail(callback: types.CallbackQuery):
         body = html.escape(
             raw_body) if raw_body else "<i>Текст отсутствует (возможно, письмо только в HTML-формате).</i>"
 
-        # Ограничение Telegram на длину сообщения
         if len(body) > 3000:
             body = body[:3000] + "\n\n...[ТЕКСТ ОБРЕЗАН]..."
 
@@ -217,31 +297,26 @@ async def process_back(callback: types.CallbackQuery):
     )
 
 
-# --- Интеграция с веб-сервером для Render (Health Check) ---
+# --- Интеграция с веб-сервером для Render ---
 
 async def health_check(request):
-    """Ответ для пингеров, чтобы Render не усыплял сервис"""
     return web.Response(text="Bot is running 24/7!")
 
 
 async def main():
-    # Настройка логирования
     logging.basicConfig(level=logging.INFO)
 
-    # 1. Настройка и запуск веб-сервера aiohttp
     app = web.Application()
     app.router.add_get('/', health_check)
 
     runner = web.AppRunner(app)
     await runner.setup()
 
-    # Render автоматически передает порт в переменную окружения PORT
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"Web server successfully started on port {port}")
 
-    # 2. Запуск долгого опроса (polling) бота Telegram
     await dp.start_polling(bot)
 
 
